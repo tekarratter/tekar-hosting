@@ -1,0 +1,15 @@
+{
+  "admin": { "listen": "unix//run/caddy/admin.sock" },
+  "apps": {
+    "http": {
+      "servers": {
+        "http": {
+          "listen": [":80"],
+          "routes": [
+            { "handle": [{ "handler": "static_response", "status_code": 404, "body": "Tekar Hosting: no route" }] }
+          ]
+        }
+      }
+    }
+  }
+}

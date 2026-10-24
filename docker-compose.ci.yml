@@ -1,0 +1,31 @@
+# Build mọi image của Tekar Hosting từ mã nguồn (cài mới trên máy khác, CI, cập nhật code).
+# docker-compose.yml chỉ khai báo image cho th-api/th-worker; file này thêm phần build.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.ci.yml --profile claude --profile devbox build
+#   docker compose up -d                     # chạy như thường (tự nạp docker-compose.override.yml)
+#
+# Chỉ dùng file này để BUILD: chạy `up` kèm `-f` sẽ không nạp docker-compose.override.yml (cổng của th-caddy).
+# Tag image theo TH_VERSION (mặc định latest), ví dụ: TH_VERSION=1.4.0 docker compose -f ... build
+services:
+  th-api:
+    build: &panel-build
+      context: .
+      dockerfile: Dockerfile
+      labels:
+        org.opencontainers.image.title: tekar-hosting
+        org.opencontainers.image.version: ${TH_VERSION:-latest}
+  th-worker:
+    build: *panel-build  # cùng image tekar-hosting:<TH_VERSION> với th-api
+
+  # Image môi trường phát triển (app "devbox"). Panel tự build nếu thiếu; build sẵn ở đây để lần deploy đầu nhanh hơn.
+  # Đổi tag ở đây khi đổi IMAGE trong backend/app/services/devbox.py.
+  th-devbox-image:
+    build:
+      context: ./backend/app/devbox
+      labels:
+        th.devbox: "1"
+    image: tekar-devbox:1
+    profiles: ["devbox"]
+    entrypoint: ["true"]
+    restart: "no"
+    networks: []

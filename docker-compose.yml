@@ -1,0 +1,106 @@
+# Tekar Hosting — control plane
+# Build: docker compose -f docker-compose.yml -f docker-compose.ci.yml build   (xem docker-compose.ci.yml)
+# Chạy:  cp .env.example .env && (sửa .env) && docker compose up -d
+name: tekar-hosting
+
+x-api-common: &api-common
+  image: tekar-hosting:${TH_VERSION:-latest}
+  restart: unless-stopped
+  env_file: .env
+  environment:
+    TH_DATABASE_URL: postgresql+asyncpg://th:${TH_DB_PASSWORD}@th-db:5432/th
+    TH_DATA_DIR: ${TH_DATA_DIR}
+    TH_CADDY_ADMIN: unix:///run/caddy/admin.sock
+    TH_HOST_PROC: /host/proc
+    TH_HOST_CGROUP: /host/cgroup
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+    # Mount cùng đường dẫn tuyệt đối để `docker compose` + bind mount hoạt động đúng
+    - ${TH_DATA_DIR}:${TH_DATA_DIR}
+    # Gốc lưu trữ: mọi thư mục apps/backup/volume/data cấu hình trong panel phải nằm dưới đây
+    - ${TH_STORAGE_ROOT:-/data}:${TH_STORAGE_ROOT:-/data}
+    - /proc:/host/proc:ro
+    - /sys/fs/cgroup:/host/cgroup:ro
+    - trivy-cache:/root/.cache/trivy
+    - caddy-admin:/run/caddy
+    - claude-home:/claude-home
+  extra_hosts:
+    - host.docker.internal:host-gateway
+  depends_on:
+    th-db:
+      condition: service_healthy
+  networks: [default, th-edge]
+
+services:
+  th-api:
+    <<: *api-common
+    container_name: th-api
+    # Chỉ tin X-Forwarded-For từ mạng docker của Caddy/NPM (TH_TRUSTED_PROXIES) — không tin "*" (client tự ghi IP để qua mặt
+    # chống dò mật khẩu / audit log). Xem mạng bằng: docker network inspect th-edge --format '{{(index .IPAM.Config 0).Subnet}}'
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers", "--forwarded-allow-ips", "${TH_TRUSTED_PROXIES:-172.16.0.0/12}"]
+    ports:
+      - "${TH_PANEL_BIND:-0.0.0.0}:${TH_PANEL_PORT:-9900}:8000"
+
+  th-worker:
+    <<: *api-common
+    container_name: th-worker
+    command: ["python", "-m", "app.worker"]
+
+  th-db:
+    image: postgres:17-alpine
+    container_name: th-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: th
+      POSTGRES_PASSWORD: ${TH_DB_PASSWORD}
+      POSTGRES_DB: th
+    volumes:
+      - ${TH_DATA_DIR}/db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U th"]
+      interval: 5s
+      retries: 20
+
+  th-caddy:
+    build: ./caddy
+    image: tekar-hosting-caddy:latest
+    container_name: th-caddy
+    restart: unless-stopped
+    # Config được control plane đẩy qua Admin API; lần khởi động đầu dùng bootstrap.json
+    command: ["caddy", "run", "--config", "/etc/caddy/bootstrap.json", "--resume"]
+    ports:
+      - "${TH_CADDY_HTTP_PORT:-8880}:80"
+      - "${TH_CADDY_HTTPS_PORT:-8843}:443"
+    volumes:
+      - ./caddy/bootstrap.json:/etc/caddy/bootstrap.json:ro
+      - ${TH_DATA_DIR}/caddy/data:/data
+      - ${TH_DATA_DIR}/caddy/config:/config
+      # Admin API chỉ mở qua unix socket dùng chung với th-api (app trên mạng edge không với tới được)
+      - caddy-admin:/run/caddy
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    networks: [th-edge]
+
+  # Claude Code console — đăng nhập bằng tài khoản Claude qua web terminal,
+  # kết nối MCP tới panel để đọc/cấu hình hệ thống.
+  th-claude:
+    build: ./claude-console
+    image: tekar-hosting-claude:latest
+    container_name: th-claude
+    restart: unless-stopped
+    environment:
+      TH_MCP_URL: http://th-api:8000/mcp
+    volumes:
+      - claude-home:/home/claude
+    networks: [default]
+    profiles: ["claude"]
+
+networks:
+  th-edge:
+    name: th-edge
+    external: true
+
+volumes:
+  trivy-cache:
+  caddy-admin:
+  claude-home:

@@ -1,0 +1,9 @@
+# secret & dữ liệu runtime — không commit
+.env
+data/
+# do panel sinh (Proxy → Cổng & chuyển đổi)
+docker-compose.override.yml
+__pycache__/
+*.pyc
+frontend/node_modules/
+frontend/dist/

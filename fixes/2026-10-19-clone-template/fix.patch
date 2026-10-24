@@ -1,0 +1,246 @@
+--- a/backend/app/routers/apps.py
++++ b/backend/app/routers/apps.py
+@@ -217,7 +217,8 @@
+         k = m.group(1)
+         if k == "random":
+             return random_password(24)
+-        return vars_.get(k, m.group(0))
++        v = vars_.get(k, "")
++        return random_password(24) if v.strip() == "${random}" else v  # ô để "${random}" → sinh ngẫu nhiên; bỏ trống → rỗng
+ 
+     return re.sub(r"\$\{(\w+)\}", rep, text)
+ 
+@@ -284,7 +285,16 @@
+     await db.refresh(app)
+     compose.write_managed_files(app)  # file có trên đĩa ngay, kể cả khi chưa deploy
+ 
+-    for s in body.services:
++    wanted = body.services
++    if tpl and not wanted and tpl.get("services"):  # gọi qua API/MCP không chọn dịch vụ → lấy dịch vụ đầu tiên đúng loại
++        from ..models import PlatformService
++
++        svcs = (await db.execute(select(PlatformService).order_by(PlatformService.id))).scalars().all()
++        first = {}
++        for s in svcs:
++            first.setdefault(s.kind, s.id)
++        wanted = [{"service_id": first[k]} for k in tpl["services"] if k in first]
++    for s in wanted:
+         await bind_service(db, app, int(s["service_id"]), s.get("env_prefix", ""), user)
+ 
+     if body.domain and web:
+@@ -298,9 +308,21 @@
+     return {**app_out(app, "owner"), "job_id": job.id if job else None}
+ 
+ 
++def _upstream_host(app: App, service: str) -> str:
++    """Tên container của service trên mạng edge: container_name nếu compose đặt, mặc định <project>-<service>-1."""
++    import yaml
++
++    try:
++        svc = ((yaml.safe_load(app.compose_yaml or "") or {}).get("services") or {}).get(service) or {}
++    except yaml.YAMLError:
++        svc = {}
++    name = svc.get("container_name")
++    return name if isinstance(name, str) and name and "$" not in name else f"{app.compose_project}-{service}-1"
++
++
+ async def _add_route(db, app: App, domain: str, web: dict[str, Any]) -> None:
+     db.add(ProxyRoute(app_id=app.id, hosts=[domain.strip().lower()],
+-                      upstreams=[f"{app.compose_project}-{web['service']}-1:{web['port']}"],
++                      upstreams=[f"{_upstream_host(app, web['service'])}:{web['port']}"],
+                       source="template", cf_tunnel=True, tls_mode="tunnel"))
+     await db.commit()
+     from .proxy import apply_all
+@@ -391,6 +413,11 @@
+     if (await db.execute(select(App).where((App.slug == body.slug) | (App.compose_project == f"th-{body.slug}")))).scalar_one_or_none():
+         raise HTTPException(400, "Slug đã tồn tại")
+     text, env, copy_root = _source_compose(src)
++    if body.domain:  # DOMAIN của app gốc nằm trong phần env người dùng → thay bằng domain mới
++        dom = body.domain.strip().lower()
++        env, n = re.subn(r"(?m)^DOMAIN=.*$", f"DOMAIN={dom}", env)
++        if not n:
++            env = env.rstrip("\n") + f"\nDOMAIN={dom}\n"
+     doc = yaml.safe_load(text) or {}
+     for svc in (doc.get("services") or {}).values():
+         if isinstance(svc, dict):
+--- a/backend/app/services/app_jobs.py
++++ b/backend/app/services/app_jobs.py
+@@ -74,6 +74,36 @@
+                 await ctx.log(f"Gắn {c.name} vào mạng {settings.edge_network}")
+ 
+ 
++async def platform_bindings(app: App) -> tuple[dict[str, str], set[str]]:
++    """Env tiêm từ binding + tên container/host của dịch vụ nền tảng mà app kết nối tới."""
++    env: dict[str, str] = {}
++    hosts: set[str] = set()
++    async with SessionLocal() as s:
++        for b in (await s.execute(select(ServiceBinding).where(ServiceBinding.app_id == app.id))).scalars():
++            env.update(platform.binding_env(b))
++            hosts.update(h for h in (b.service.container_name, platform.app_host(b.service)[0]) if h)
++    return env, hosts
++
++
++async def connect_platform(app: App, hosts: set[str], ctx: JobContext | None = None) -> str | None:
++    """Tạo mạng th-svc-<slug> (external, `compose down` không xoá) và gắn container dịch vụ nền tảng vào đó.
++    Host không phải container trên máy này (server external qua IP/DNS) thì bỏ qua."""
++    if not hosts:
++        return None
++    net = compose.platform_network(app)
++    await docker_svc.ensure_network(net)
++    for h in sorted(hosts):
++        try:
++            if await docker_svc.get_container(h) is None:
++                continue
++            if await docker_svc.connect_network(h, net) and ctx:
++                await ctx.log(f"Gắn {h} vào mạng {net}")
++        except Exception as e:  # noqa: BLE001 — tên không hợp lệ làm tên container (IP:port, URL…)
++            if ctx:
++                await ctx.log(f"⚠ gắn {h} vào {net}: {e}")
++    return net
++
++
+ @job_handler("deploy")
+ async def job_deploy(ctx: JobContext, params: dict[str, Any]) -> dict[str, Any]:
+     app = await _load(params["app_id"])
+@@ -85,12 +115,10 @@
+         app = row
+     await docker_svc.ensure_network(settings.edge_network)
+     await ctx.log(f"Deploy {app.name} ({app.kind}) project={app.compose_project}")
+-    service_env: dict[str, str] = {}
+-    async with SessionLocal() as s:
+-        for b in (await s.execute(select(ServiceBinding).where(ServiceBinding.app_id == app.id))).scalars():
+-            service_env.update(platform.binding_env(b))
++    service_env, hosts = await platform_bindings(app)
++    svc_net = await connect_platform(app, hosts, ctx)
+     build = params.get("build", bool((app.git or {}).get("repo")))  # app từ git: build lại image từ code
+-    await compose.deploy(app, ctx, pull=params.get("pull", True), service_env=service_env, build=build)
++    await compose.deploy(app, ctx, pull=params.get("pull", True), service_env=service_env, build=build, svc_network=svc_net)
+     status = await refresh_status(app)
+     async with SessionLocal() as s:
+         row = await s.get(App, app.id)
+@@ -197,7 +225,7 @@
+ async def job_limits(ctx: JobContext, params: dict[str, Any]) -> dict[str, Any]:
+     app = await _load(params["app_id"])
+     if compose.files_accessible(app):
+-        await compose.write_override(app)
++        await compose.write_override(app, await connect_platform(app, (await platform_bindings(app))[1], ctx))
+     else:
+         await ctx.log("Không truy cập được compose → chỉ áp dụng trực tiếp (docker update / network connect), mất khi container bị tạo lại")
+     await apply_live_limits(app, ctx)
+@@ -222,6 +250,11 @@
+         row = await s.get(App, app.id)
+         await s.delete(row)
+         await s.commit()
++    if params.get("remove_containers", True):
++        try:
++            await docker_svc.remove_network(compose.platform_network(app))
++        except Exception as e:  # noqa: BLE001
++            await ctx.log(f"⚠ xoá mạng {compose.platform_network(app)}: {e}")
+     import shutil
+ 
+     if params.get("remove_files"):
+--- a/backend/app/services/compose.py
++++ b/backend/app/services/compose.py
+@@ -178,6 +178,12 @@
+     return None
+ 
+ 
++def platform_network(app: App) -> str:
++    """Mạng riêng của app để tới dịch vụ nền tảng: chỉ service của app này + container postgres/redis/s3 dùng chung
++    (không dùng mạng chung vì alias tên service như `db`, `redis` sẽ trỏ nhầm sang app khác)."""
++    return f"th-svc-{app.slug}"
++
++
+ def write_compose(app: App) -> None:
+     d = Path(app.work_dir)
+     d.mkdir(parents=True, exist_ok=True)
+@@ -189,6 +195,9 @@
+     d.mkdir(parents=True, exist_ok=True)
+     env_text = decrypt(app.env_enc).rstrip("\n") + "\n"
+     gen = dict(service_env or {})
++    # stack name: `docker compose up -d` chạy tay trong thư mục dùng đúng project như panel (không sinh stack trùng)
++    gen["COMPOSE_PROJECT_NAME"] = app.compose_project
++    gen["APP_SLUG"] = app.slug
+     if app.data_dir:
+         gen["APP_DATA_DIR"] = app.data_dir
+     if gen:
+@@ -220,8 +229,8 @@
+     return json.loads(out[out.index("{"):])
+ 
+ 
+-async def write_override(app: App) -> None:
+-    """Sinh compose.th.yml: label th.app, giới hạn tài nguyên, gắn mạng edge."""
++async def write_override(app: App, svc_network: str | None = None) -> None:
++    """Sinh compose.th.yml: label th.app, giới hạn tài nguyên, gắn mạng edge + mạng dịch vụ nền tảng."""
+     cfg = await normalized_config(app)
+     services: dict[str, Any] = {}
+     for name, svc in (cfg.get("services") or {}).items():
+@@ -236,13 +245,17 @@
+             if mem:
+                 limits["memory"] = f"{int(mem)}M"
+             o["deploy"] = {"resources": {"limits": limits}}
+-        if name in (app.edge_services or []) and not svc.get("network_mode"):
+-            nets = svc.get("networks") or {"default": None}
+-            o["networks"] = {**{k: v for k, v in nets.items()}, settings.edge_network: {}}
++        if not svc.get("network_mode"):
++            extra = ([settings.edge_network] if name in (app.edge_services or []) else []) + ([svc_network] if svc_network else [])
++            if extra:
++                nets = svc.get("networks") or {"default": None}
++                o["networks"] = {**{k: v for k, v in nets.items()}, **{n: {} for n in extra}}
+         services[name] = o
+     doc: dict[str, Any] = {"services": services}
+-    if any("networks" in s for s in services.values()):
+-        doc["networks"] = {settings.edge_network: {"external": True, "name": settings.edge_network}}
++    used = {n for s in services.values() for n in (s.get("networks") or {})}
++    ext = [n for n in (settings.edge_network, svc_network) if n and n in used]
++    if ext:
++        doc["networks"] = {n: {"external": True, "name": n} for n in ext}
+     # volume dạng thư mục (vendor-free): dữ liệu nằm ở <volumes_dir>/<tên volume>, xem/chép trực tiếp được
+     if app.volumes_dir:
+         vols: dict[str, Any] = {}
+@@ -265,7 +278,8 @@
+         fix_owner(app)
+ 
+ 
+-async def deploy(app: App, ctx: JobContext, pull: bool = True, service_env: dict[str, str] | None = None, build: bool = False) -> None:
++async def deploy(app: App, ctx: JobContext, pull: bool = True, service_env: dict[str, str] | None = None, build: bool = False,
++                 svc_network: str | None = None) -> None:
+     if app.kind == "adopted" and not files_accessible(app):
+         raise RuntimeError("Không truy cập được file compose (app do Dockhand/Portainer quản lý) — hãy deploy từ công cụ đó")
+     if app.kind == "managed":
+@@ -273,7 +287,7 @@
+             write_compose(app)
+         write_env(app, service_env)
+         write_readme(app)
+-    await write_override(app)
++    await write_override(app, svc_network)
+     if pull:
+         await run_cmd(base_cmd(app) + ["pull", "--ignore-buildable", "--quiet"], ctx, check=False)
+     await run_cmd(base_cmd(app) + ["up", "-d", "--remove-orphans"] + (["--build"] if build else []), ctx)
+--- a/backend/app/services/docker_svc.py
++++ b/backend/app/services/docker_svc.py
+@@ -197,6 +197,24 @@
+     return await run(_connect)
+ 
+ 
++async def remove_network(name: str) -> None:
++    """Gỡ mọi container còn gắn rồi xoá mạng (bỏ qua nếu không có)."""
++    def _rm():
++        try:
++            net = client().networks.get(name)
++        except NotFound:
++            return
++        net.reload()
++        for cid in (net.attrs.get("Containers") or {}):
++            try:
++                net.disconnect(cid, force=True)
++            except Exception:  # noqa: BLE001
++                pass
++        net.remove()
++
++    await run(_rm)
++
++
+ async def ensure_image(image: str) -> None:
+     def _ensure():
+         try:
